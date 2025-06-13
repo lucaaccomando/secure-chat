@@ -25,7 +25,7 @@ user_exiting = threading.Event()
 
 def graceful_exit(client_socket=None, receiver_thread=None):
     if user_exiting.is_set():
-        return  
+        return
     user_exiting.set()
     print("\n[*] Disconnecting...")
     try:
@@ -42,7 +42,8 @@ def print_available_recipients():
     with recipient_lock:
         return bool(public_key_registry)
 
-def receive_messages(client_socket):
+def receive_messages(client_socket, client_name):
+    global recipient_name
     try:
         while True:
             data = client_socket.recv(4096)
@@ -61,14 +62,14 @@ def receive_messages(client_socket):
                         with recipient_lock:
                             public_key_registry.clear()
                             for user, key_pem in new_keys.items():
-                                public_key_registry[user] = deserialize_public_key(key_pem.encode('utf-8'))
+                                if user != client_name:
+                                    public_key_registry[user] = deserialize_public_key(key_pem.encode('utf-8'))
                         keys_received_event.set()
                         continue
 
                     elif payload.get("type") == "error":
                         print(f"\n[!] Server error: {payload.get('message')}")
                         with recipient_lock:
-                            global recipient_name
                             recipient_name = None
                         continue
 
@@ -90,9 +91,10 @@ def receive_messages(client_socket):
                         if recipient_name == left_user:
                             recipient_name = None
                             print(f"\n[!] Your recipient ({left_user}) has disconnected.")
+                            print("[!] No users available to message. Waiting for others to join...")
                         if left_user in public_key_registry:
                             del public_key_registry[left_user]
-                
+
                 print(f"\r{decoded}\nYou: ", end='', flush=True)
 
     except (ConnectionResetError, ConnectionAbortedError, OSError):
@@ -129,7 +131,7 @@ def main():
     print("Connected. Type messages and hit Enter to send.")
     print("Press Ctrl+C to disconnect at any time.")
 
-    receiver_thread = threading.Thread(target=receive_messages, args=(client,))
+    receiver_thread = threading.Thread(target=receive_messages, args=(client, name))
     receiver_thread.start()
 
     try:
@@ -139,7 +141,6 @@ def main():
     except KeyboardInterrupt:
         graceful_exit(client, receiver_thread)
 
-    # Initial recipient selection
     notified_waiting = False
     while True:
         try:
@@ -166,7 +167,6 @@ def main():
         notified_no_users = False
 
         while True:
-            # === STATE CHECK & RECIPIENT SELECTION ===
             with recipient_lock:
                 if recipient_name is None or recipient_name not in public_key_registry:
                     print("\n[!] No recipient selected or your recipient has disconnected.")
@@ -193,8 +193,6 @@ def main():
                             time.sleep(1)
                     continue
 
-            # === MESSAGE SENDING ===
-            # Capture recipient state BEFORE blocking for input
             with recipient_lock:
                 current_recipient_for_msg = recipient_name
                 recipient_public_key = public_key_registry.get(current_recipient_for_msg)
@@ -204,7 +202,6 @@ def main():
             except KeyboardInterrupt:
                 graceful_exit(client, receiver_thread)
 
-            # CRITICAL: Re-check state AFTER blocking to prevent race condition
             with recipient_lock:
                 if recipient_name != current_recipient_for_msg:
                     print(f"\n[!] Message not sent. {current_recipient_for_msg} disconnected while you were typing.")
