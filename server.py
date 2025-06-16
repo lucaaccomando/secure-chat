@@ -64,7 +64,7 @@ def handle_client(client_socket, address):
                                 del clients[recipient]
                                 if recipient in public_keys:
                                     del public_keys[recipient]
-                                broadcast(f"{recipient} has left the chat.".encode('utf-8'), sender_name=None)
+                                broadcast(f"User {recipient} disconnected.".encode('utf-8'), sender_name=None)
                                 sync_keys_to_all()
                                 
                                 # Notify sender about the failure
@@ -109,7 +109,8 @@ def handle_client(client_socket, address):
         
         if name:
             try:
-                broadcast(f"{name} has left the chat.".encode('utf-8'), sender_name=None)
+                broadcast(f"User {name} disconnected.".encode('utf-8'), sender_name=None)
+
                 sync_keys_to_all()
             except:
                 pass

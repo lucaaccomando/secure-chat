@@ -13,6 +13,10 @@ from crypto_utils import (
     encrypt_key_with_rsa,
     decrypt_key_with_rsa,
 )
+import asyncio
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit import print_formatted_text
 
 HOST = '127.0.0.1'
 PORT = 65432
@@ -22,7 +26,7 @@ recipient_name = None
 recipient_lock = threading.Lock()
 keys_received_event = threading.Event()
 user_exiting = threading.Event()
-
+prompt_should_abort = threading.Event()
 def graceful_exit(client_socket=None, receiver_thread=None):
     if user_exiting.is_set():
         return
@@ -68,7 +72,7 @@ def receive_messages(client_socket, client_name):
                         continue
 
                     elif payload.get("type") == "error":
-                        print(f"\n[!] Server error: {payload.get('message')}")
+                        print_formatted_text(f"\n[!] Server error: {payload.get('message')}")
                         with recipient_lock:
                             recipient_name = None
                         continue
@@ -80,22 +84,24 @@ def receive_messages(client_socket, client_name):
                     aes_key = decrypt_key_with_rsa(encrypted_key, private_key)
                     plaintext = aes_decrypt(encrypted_msg, aes_key)
 
-                    print(f"\r{sender}: {plaintext}\nYou: ", end='', flush=True)
+                    print_formatted_text(f"\n{sender}: {plaintext}")
 
                 except Exception as e:
                     print(f"\n[!] Error decrypting message: {e}")
             else:
-                if "has left the chat" in decoded:
-                    left_user = decoded.split(" has left")[0]
+                if decoded.startswith("User ") and decoded.endswith(" disconnected."):
+                    left_user = decoded.split(" ")[1]
                     with recipient_lock:
                         if recipient_name == left_user:
                             recipient_name = None
-                            print(f"\n[!] Your recipient ({left_user}) has disconnected.")
-                            print("[!] No users available to message. Waiting for others to join...")
                         if left_user in public_key_registry:
                             del public_key_registry[left_user]
+                    print_formatted_text(f"\n[!] {decoded}")
+                    continue
 
-                print(f"\r{decoded}\nYou: ", end='', flush=True)
+
+
+                print_formatted_text(f"\n{decoded}")
 
     except (ConnectionResetError, ConnectionAbortedError, OSError):
         if not user_exiting.is_set():
@@ -130,6 +136,8 @@ def main():
 
     print("Connected. Type messages and hit Enter to send.")
     print("Press Ctrl+C to disconnect at any time.")
+    session = PromptSession()
+
 
     receiver_thread = threading.Thread(target=receive_messages, args=(client, name))
     receiver_thread.start()
@@ -197,38 +205,67 @@ def main():
                 current_recipient_for_msg = recipient_name
                 recipient_public_key = public_key_registry.get(current_recipient_for_msg)
 
-            try:
-                msg = input("You: ")
-            except KeyboardInterrupt:
-                graceful_exit(client, receiver_thread)
-
-            with recipient_lock:
-                if recipient_name != current_recipient_for_msg:
-                    print(f"\n[!] Message not sent. {current_recipient_for_msg} disconnected while you were typing.")
-                    continue
-
-            if not recipient_public_key:
-                print(f"[!] No public key for {current_recipient_for_msg}. Message not sent.")
-                continue
-
-            aes_key = generate_aes_key()
-            ciphertext = aes_encrypt(msg, aes_key)
-            encrypted_key = encrypt_key_with_rsa(aes_key, recipient_public_key)
-
-            message_package = {
-                "from": name,
-                "to": current_recipient_for_msg,
-                "aes_key": encrypted_key.hex(),
-                "message": ciphertext.hex()
-            }
-
-            client.sendall(json.dumps(message_package).encode('utf-8'))
+            asyncio.run(message_loop(session, client, name, receiver_thread))
+            break  
+            
 
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         if not user_exiting.is_set():
             print("\n[!] Server connection lost.")
     finally:
         graceful_exit(client, receiver_thread)
+
+
+async def message_loop(session, client, name, receiver_thread):
+    global recipient_name
+    while True:
+        with recipient_lock:
+            if recipient_name is None or recipient_name not in public_key_registry:
+                print("\n[!] No recipient selected or your recipient has disconnected.")
+                return
+
+        with recipient_lock:
+            current_recipient_for_msg = recipient_name
+            recipient_public_key = public_key_registry.get(current_recipient_for_msg)
+
+        with patch_stdout():
+            if prompt_should_abort.is_set():
+                prompt_should_abort.clear()
+                continue
+            try:
+                msg = await session.prompt_async("You: ")
+
+
+                with recipient_lock:
+                    if recipient_name is None or recipient_name != current_recipient_for_msg:
+                        print_formatted_text(f"\n[!] Message not sent. {current_recipient_for_msg} disconnected while you were typing.")
+                        return  
+
+            except (KeyboardInterrupt, EOFError):
+                graceful_exit(client, receiver_thread)
+
+        with recipient_lock:
+            if recipient_name != current_recipient_for_msg:
+                print(f"\n[!] Message not sent. {current_recipient_for_msg} disconnected while you were typing.")
+                continue
+
+        if not recipient_public_key:
+            print(f"[!] No public key for {current_recipient_for_msg}. Message not sent.")
+            continue
+
+        aes_key = generate_aes_key()
+        ciphertext = aes_encrypt(msg, aes_key)
+        encrypted_key = encrypt_key_with_rsa(aes_key, recipient_public_key)
+
+        message_package = {
+            "from": name,
+            "to": current_recipient_for_msg,
+            "aes_key": encrypted_key.hex(),
+            "message": ciphertext.hex()
+        }
+
+        client.sendall(json.dumps(message_package).encode('utf-8'))
+
 
 if __name__ == "__main__":
     main()
