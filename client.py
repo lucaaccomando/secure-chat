@@ -13,14 +13,13 @@ from crypto_utils import (
     encrypt_key_with_rsa,
     decrypt_key_with_rsa,
 )
-import asyncio
-from prompt_toolkit import PromptSession
-from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit import print_formatted_text
+import queue
+from prompt_toolkit import print_formatted_text  # Keep this for now if you like the styled output
+
 
 HOST = '127.0.0.1'
 PORT = 65432
-
+input_queue = queue.Queue()
 public_key_registry = {}
 recipient_name = None
 recipient_lock = threading.Lock()
@@ -136,7 +135,7 @@ def main():
 
     print("Connected. Type messages and hit Enter to send.")
     print("Press Ctrl+C to disconnect at any time.")
-    session = PromptSession()
+    
 
 
     receiver_thread = threading.Thread(target=receive_messages, args=(client, name))
@@ -200,12 +199,7 @@ def main():
                                 notified_no_users = True
                             time.sleep(1)
                     continue
-
-            with recipient_lock:
-                current_recipient_for_msg = recipient_name
-                recipient_public_key = public_key_registry.get(current_recipient_for_msg)
-
-            asyncio.run(message_loop(session, client, name, receiver_thread))
+            message_loop_thread(client, name, receiver_thread)
             break  
             
 
@@ -216,55 +210,69 @@ def main():
         graceful_exit(client, receiver_thread)
 
 
-async def message_loop(session, client, name, receiver_thread):
+def message_loop_thread(client, name, receiver_thread):
     global recipient_name
-    while True:
-        with recipient_lock:
-            if recipient_name is None or recipient_name not in public_key_registry:
-                print("\n[!] No recipient selected or your recipient has disconnected.")
+
+    input_queue = queue.Queue()
+
+    def input_thread_loop():
+        try:
+            while True:
+                msg = input("You: ")
+                input_queue.put(msg)
+        except (KeyboardInterrupt, EOFError):
+            graceful_exit(client, receiver_thread)
+
+    input_thread = threading.Thread(target=input_thread_loop)
+    input_thread.daemon = True
+    input_thread.start()
+
+    try:
+        while True:
+            if user_exiting.is_set():
                 return
 
-        with recipient_lock:
-            current_recipient_for_msg = recipient_name
-            recipient_public_key = public_key_registry.get(current_recipient_for_msg)
+            with recipient_lock:
+                if recipient_name is None or recipient_name not in public_key_registry:
+                    print("\n[!] No recipient selected or your recipient has disconnected.")
+                    return
 
-        with patch_stdout():
-            if prompt_should_abort.is_set():
-                prompt_should_abort.clear()
-                continue
+                current_recipient_for_msg = recipient_name
+                recipient_public_key = public_key_registry.get(current_recipient_for_msg)
+
             try:
-                msg = await session.prompt_async("You: ")
-
-
-                with recipient_lock:
-                    if recipient_name is None or recipient_name != current_recipient_for_msg:
-                        print_formatted_text(f"\n[!] Message not sent. {current_recipient_for_msg} disconnected while you were typing.")
-                        return  
-
-            except (KeyboardInterrupt, EOFError):
-                graceful_exit(client, receiver_thread)
-
-        with recipient_lock:
-            if recipient_name != current_recipient_for_msg:
-                print(f"\n[!] Message not sent. {current_recipient_for_msg} disconnected while you were typing.")
+                msg = input_queue.get(timeout=0.5)
+            except queue.Empty:
                 continue
 
-        if not recipient_public_key:
-            print(f"[!] No public key for {current_recipient_for_msg}. Message not sent.")
-            continue
+            with recipient_lock:
+                if recipient_name != current_recipient_for_msg:
+                    print(f"\n[!] Message not sent. {current_recipient_for_msg} disconnected while you were typing.")
+                    continue
 
-        aes_key = generate_aes_key()
-        ciphertext = aes_encrypt(msg, aes_key)
-        encrypted_key = encrypt_key_with_rsa(aes_key, recipient_public_key)
+            if not recipient_public_key:
+                print(f"[!] No public key for {current_recipient_for_msg}. Message not sent.")
+                continue
 
-        message_package = {
-            "from": name,
-            "to": current_recipient_for_msg,
-            "aes_key": encrypted_key.hex(),
-            "message": ciphertext.hex()
-        }
+            aes_key = generate_aes_key()
+            ciphertext = aes_encrypt(msg, aes_key)
+            encrypted_key = encrypt_key_with_rsa(aes_key, recipient_public_key)
 
-        client.sendall(json.dumps(message_package).encode('utf-8'))
+            message_package = {
+                "from": name,
+                "to": current_recipient_for_msg,
+                "aes_key": encrypted_key.hex(),
+                "message": ciphertext.hex()
+            }
+
+            try:
+                client.sendall(json.dumps(message_package).encode('utf-8'))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                print("\n[!] Server connection lost.")
+                graceful_exit(client, receiver_thread)
+    except KeyboardInterrupt:
+        graceful_exit(client, receiver_thread)
+
 
 
 if __name__ == "__main__":
