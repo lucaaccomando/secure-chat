@@ -3,18 +3,18 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.backends import default_backend
+import hashlib
 import os
 
-# === RSA Keypair ===
+
 def generate_rsa_keypair():
     private_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048
     )
-    public_key = private_key.public_key()
-    return private_key, public_key
+    return private_key, private_key.public_key()
 
-# === RSA Serialization ===
+
 def serialize_public_key(public_key):
     return public_key.public_bytes(
         encoding=serialization.Encoding.PEM,
@@ -34,33 +34,57 @@ def serialize_private_key(private_key):
 def deserialize_private_key(pem_data):
     return serialization.load_pem_private_key(pem_data, password=None)
 
-# === AES (CBC mode with PKCS7 padding) ===
+
 def generate_aes_key():
-    return os.urandom(32)  # 256-bit AES
+    return os.urandom(32)
 
-def aes_encrypt(plaintext, key):
-    iv = os.urandom(16)  # AES block size
+
+# GCM: nonce (12) + tag (16) + ciphertext
+def aes_encrypt_gcm(plaintext, key):
+    nonce = os.urandom(12)
+    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce), backend=default_backend())
+    enc = cipher.encryptor()
+    ciphertext = enc.update(plaintext.encode('utf-8')) + enc.finalize()
+    return nonce + enc.tag + ciphertext
+
+def aes_decrypt_gcm(data, key):
+    nonce = data[:12]
+    tag = data[12:28]
+    ciphertext = data[28:]
+    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag), backend=default_backend())
+    dec = cipher.decryptor()
+    return (dec.update(ciphertext) + dec.finalize()).decode('utf-8')
+
+
+# CBC kept for benchmarks only
+def aes_encrypt_cbc(plaintext, key):
+    iv = os.urandom(16)
     padder = sym_padding.PKCS7(128).padder()
-    padded_data = padder.update(plaintext.encode('utf-8')) + padder.finalize()
-
+    padded = padder.update(plaintext.encode('utf-8')) + padder.finalize()
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
-    return iv + ciphertext  # prepend IV to ciphertext
+    enc = cipher.encryptor()
+    return iv + enc.update(padded) + enc.finalize()
 
-def aes_decrypt(encrypted_data, key):
-    iv = encrypted_data[:16]
-    ciphertext = encrypted_data[16:]
-
+def aes_decrypt_cbc(data, key):
+    iv, ciphertext = data[:16], data[16:]
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-
+    dec = cipher.decryptor()
+    padded = dec.update(ciphertext) + dec.finalize()
     unpadder = sym_padding.PKCS7(128).unpadder()
-    plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
-    return plaintext.decode('utf-8')
+    return (unpadder.update(padded) + unpadder.finalize()).decode('utf-8')
 
-# === RSA for Encrypting AES Keys ===
+
+def aes_encrypt(plaintext, key, mode='gcm'):
+    if mode == 'gcm':
+        return aes_encrypt_gcm(plaintext, key)
+    return aes_encrypt_cbc(plaintext, key)
+
+def aes_decrypt(data, key, mode='gcm'):
+    if mode == 'gcm':
+        return aes_decrypt_gcm(data, key)
+    return aes_decrypt_cbc(data, key)
+
+
 def encrypt_key_with_rsa(aes_key, public_key):
     return public_key.encrypt(
         aes_key,
@@ -80,3 +104,35 @@ def decrypt_key_with_rsa(encrypted_key, private_key):
             label=None
         )
     )
+
+
+def sign_message(message_bytes, private_key):
+    return private_key.sign(
+        message_bytes,
+        rsa_padding.PSS(
+            mgf=rsa_padding.MGF1(hashes.SHA256()),
+            salt_length=rsa_padding.PSS.MAX_LENGTH
+        ),
+        hashes.SHA256()
+    )
+
+def verify_signature(message_bytes, signature_bytes, public_key):
+    try:
+        public_key.verify(
+            signature_bytes,
+            message_bytes,
+            rsa_padding.PSS(
+                mgf=rsa_padding.MGF1(hashes.SHA256()),
+                salt_length=rsa_padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return True
+    except Exception:
+        return False
+
+
+# sha256 fingerprint of a public key, colon-separated hex (ssh style)
+def key_fingerprint(public_key):
+    digest = hashlib.sha256(serialize_public_key(public_key)).digest()
+    return ':'.join(f'{b:02x}' for b in digest)

@@ -12,6 +12,9 @@ from crypto_utils import (
     aes_decrypt,
     encrypt_key_with_rsa,
     decrypt_key_with_rsa,
+    sign_message,
+    verify_signature,
+    key_fingerprint,
 )
 import queue
 from prompt_toolkit import print_formatted_text  # Keep this for now if you like the styled output
@@ -67,6 +70,9 @@ def receive_messages(client_socket, client_name):
                             for user, key_pem in new_keys.items():
                                 if user != client_name:
                                     public_key_registry[user] = deserialize_public_key(key_pem.encode('utf-8'))
+                            for user, pubkey in public_key_registry.items():
+                                fp = key_fingerprint(pubkey)
+                                print_formatted_text(f"\n[key] {user}: {fp}")
                         keys_received_event.set()
                         continue
 
@@ -79,6 +85,18 @@ def receive_messages(client_socket, client_name):
                     sender = payload['from']
                     encrypted_key = bytes.fromhex(payload['aes_key'])
                     encrypted_msg = bytes.fromhex(payload['message'])
+                    sig_hex = payload.get('signature', '')
+
+                    if not sig_hex:
+                        print_formatted_text(f"\n[!] no signature on message from {sender}, dropping")
+                        continue
+
+                    with recipient_lock:
+                        sender_pubkey = public_key_registry.get(sender)
+
+                    if sender_pubkey is None or not verify_signature(encrypted_msg, bytes.fromhex(sig_hex), sender_pubkey):
+                        print_formatted_text(f"\n[!] bad signature on message from {sender}, dropping")
+                        continue
 
                     aes_key = decrypt_key_with_rsa(encrypted_key, private_key)
                     plaintext = aes_decrypt(encrypted_msg, aes_key)
@@ -257,12 +275,14 @@ def message_loop_thread(client, name, receiver_thread):
             aes_key = generate_aes_key()
             ciphertext = aes_encrypt(msg, aes_key)
             encrypted_key = encrypt_key_with_rsa(aes_key, recipient_public_key)
+            signature = sign_message(ciphertext, private_key)
 
             message_package = {
                 "from": name,
                 "to": current_recipient_for_msg,
                 "aes_key": encrypted_key.hex(),
-                "message": ciphertext.hex()
+                "message": ciphertext.hex(),
+                "signature": signature.hex()
             }
 
             try:
