@@ -7,23 +7,25 @@ from crypto_utils import (
     generate_rsa_keypair,
     serialize_public_key,
     deserialize_public_key,
-    generate_aes_key,
+    generate_ecdh_keypair,
+    serialize_ecdh_public_key,
+    deserialize_ecdh_public_key,
+    derive_shared_key,
     aes_encrypt,
     aes_decrypt,
-    encrypt_key_with_rsa,
-    decrypt_key_with_rsa,
     sign_message,
     verify_signature,
     key_fingerprint,
 )
 import queue
-from prompt_toolkit import print_formatted_text  # Keep this for now if you like the styled output
+from prompt_toolkit import print_formatted_text
 
 
 HOST = '127.0.0.1'
 PORT = 65432
 input_queue = queue.Queue()
 public_key_registry = {}
+ecdh_key_registry = {}
 recipient_name = None
 recipient_lock = threading.Lock()
 keys_received_event = threading.Event()
@@ -67,9 +69,11 @@ def receive_messages(client_socket, client_name):
                         new_keys = payload.get("keys", {})
                         with recipient_lock:
                             public_key_registry.clear()
-                            for user, key_pem in new_keys.items():
+                            ecdh_key_registry.clear()
+                            for user, key_data in new_keys.items():
                                 if user != client_name:
-                                    public_key_registry[user] = deserialize_public_key(key_pem.encode('utf-8'))
+                                    public_key_registry[user] = deserialize_public_key(key_data['rsa'].encode('utf-8'))
+                                    ecdh_key_registry[user] = deserialize_ecdh_public_key(key_data['ecdh'].encode('utf-8'))
                             for user, pubkey in public_key_registry.items():
                                 fp = key_fingerprint(pubkey)
                                 print_formatted_text(f"\n[key] {user}: {fp}")
@@ -83,7 +87,6 @@ def receive_messages(client_socket, client_name):
                         continue
 
                     sender = payload['from']
-                    encrypted_key = bytes.fromhex(payload['aes_key'])
                     encrypted_msg = bytes.fromhex(payload['message'])
                     sig_hex = payload.get('signature', '')
 
@@ -93,13 +96,18 @@ def receive_messages(client_socket, client_name):
 
                     with recipient_lock:
                         sender_pubkey = public_key_registry.get(sender)
+                        sender_ecdh_pub = ecdh_key_registry.get(sender)
 
                     if sender_pubkey is None or not verify_signature(encrypted_msg, bytes.fromhex(sig_hex), sender_pubkey):
                         print_formatted_text(f"\n[!] bad signature on message from {sender}, dropping")
                         continue
 
-                    aes_key = decrypt_key_with_rsa(encrypted_key, private_key)
-                    plaintext = aes_decrypt(encrypted_msg, aes_key)
+                    if sender_ecdh_pub is None:
+                        print_formatted_text(f"\n[!] no ECDH key for {sender}, dropping")
+                        continue
+
+                    shared_key = derive_shared_key(ecdh_private_key, sender_ecdh_pub)
+                    plaintext = aes_decrypt(encrypted_msg, shared_key)
 
                     print_formatted_text(f"\n{sender}: {plaintext}")
 
@@ -113,6 +121,8 @@ def receive_messages(client_socket, client_name):
                             recipient_name = None
                         if left_user in public_key_registry:
                             del public_key_registry[left_user]
+                        if left_user in ecdh_key_registry:
+                            del ecdh_key_registry[left_user]
                     print_formatted_text(f"\n[!] {decoded}")
                     continue
 
@@ -130,7 +140,7 @@ def receive_messages(client_socket, client_name):
         graceful_exit()
 
 def main():
-    global private_key, public_key, recipient_name
+    global private_key, public_key, ecdh_private_key, ecdh_public_key, recipient_name
 
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
@@ -141,7 +151,7 @@ def main():
         return
 
     private_key, public_key = generate_rsa_keypair()
-    public_key_bytes = serialize_public_key(public_key)
+    ecdh_private_key, ecdh_public_key = generate_ecdh_keypair()
 
     try:
         name = input("Enter your name: ")
@@ -149,7 +159,11 @@ def main():
         graceful_exit()
 
     client.sendall(f"REGISTER::{name}".encode('utf-8'))
-    client.sendall(public_key_bytes)
+    key_payload = json.dumps({
+        "rsa": serialize_public_key(public_key).decode('utf-8'),
+        "ecdh": serialize_ecdh_public_key(ecdh_public_key).decode('utf-8')
+    }).encode('utf-8')
+    client.sendall(key_payload)
 
     print("Connected. Type messages and hit Enter to send.")
     print("Press Ctrl+C to disconnect at any time.")
@@ -256,7 +270,7 @@ def message_loop_thread(client, name, receiver_thread):
                     return
 
                 current_recipient_for_msg = recipient_name
-                recipient_public_key = public_key_registry.get(current_recipient_for_msg)
+                recipient_ecdh_pub = ecdh_key_registry.get(current_recipient_for_msg)
 
             try:
                 msg = input_queue.get(timeout=0.5)
@@ -268,19 +282,17 @@ def message_loop_thread(client, name, receiver_thread):
                     print(f"\n[!] Message not sent. {current_recipient_for_msg} disconnected while you were typing.")
                     continue
 
-            if not recipient_public_key:
-                print(f"[!] No public key for {current_recipient_for_msg}. Message not sent.")
+            if not recipient_ecdh_pub:
+                print(f"[!] No ECDH key for {current_recipient_for_msg}. Message not sent.")
                 continue
 
-            aes_key = generate_aes_key()
-            ciphertext = aes_encrypt(msg, aes_key)
-            encrypted_key = encrypt_key_with_rsa(aes_key, recipient_public_key)
+            shared_key = derive_shared_key(ecdh_private_key, recipient_ecdh_pub)
+            ciphertext = aes_encrypt(msg, shared_key)
             signature = sign_message(ciphertext, private_key)
 
             message_package = {
                 "from": name,
                 "to": current_recipient_for_msg,
-                "aes_key": encrypted_key.hex(),
                 "message": ciphertext.hex(),
                 "signature": signature.hex()
             }

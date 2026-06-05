@@ -7,8 +7,9 @@ import time
 HOST = '127.0.0.1'
 PORT = 65432
 
-clients = {}         # name -> socket
-public_keys = {}     # name -> public_key_bytes
+clients = {}      # name -> socket
+public_keys = {}  # name -> RSA public key bytes (PEM)
+ecdh_keys = {}    # name -> ECDH public key bytes (PEM)
 
 def broadcast(message, sender_name):
     for name, client_sock in list(clients.items()):
@@ -20,6 +21,8 @@ def broadcast(message, sender_name):
                 del clients[name]
                 if name in public_keys:
                     del public_keys[name]
+                if name in ecdh_keys:
+                    del ecdh_keys[name]
 
 def handle_client(client_socket, address):
     name = None
@@ -31,8 +34,9 @@ def handle_client(client_socket, address):
             return
 
         name = register_msg.replace("REGISTER::", "").strip()
-        public_key_bytes = client_socket.recv(2048)
-        public_keys[name] = public_key_bytes
+        key_data = json.loads(client_socket.recv(4096).decode('utf-8'))
+        public_keys[name] = key_data['rsa'].encode('utf-8')
+        ecdh_keys[name] = key_data['ecdh'].encode('utf-8')
         clients[name] = client_socket
         
         # Small delay to ensure proper synchronization
@@ -58,16 +62,15 @@ def handle_client(client_socket, address):
                             try:
                                 clients[recipient].sendall(message)
                             except:
-                                # If sending fails, treat as disconnected
                                 print(f"[!] Failed to send to {recipient}")
                                 clients[recipient].close()
                                 del clients[recipient]
                                 if recipient in public_keys:
                                     del public_keys[recipient]
+                                if recipient in ecdh_keys:
+                                    del ecdh_keys[recipient]
                                 broadcast(f"User {recipient} disconnected.".encode('utf-8'), sender_name=None)
                                 sync_keys_to_all()
-                                
-                                # Notify sender about the failure
                                 error_response = json.dumps({
                                     "type": "error",
                                     "message": f"Recipient '{recipient}' disconnected during delivery."
@@ -106,6 +109,8 @@ def handle_client(client_socket, address):
             del clients[name]
         if name in public_keys:
             del public_keys[name]
+        if name in ecdh_keys:
+            del ecdh_keys[name]
         
         if name:
             try:
@@ -145,8 +150,12 @@ def sync_keys_to_all():
     for target_name, sock in clients.items():
         try:
             other_keys = {
-                user: public_keys[user].decode('utf-8')
-                for user in public_keys if user != target_name
+                user: {
+                    "rsa": public_keys[user].decode('utf-8'),
+                    "ecdh": ecdh_keys[user].decode('utf-8')
+                }
+                for user in public_keys
+                if user != target_name and user in ecdh_keys
             }
             payload = json.dumps({"type": "key_sync", "keys": other_keys}).encode('utf-8')
             sock.sendall(payload)

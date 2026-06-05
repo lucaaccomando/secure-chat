@@ -1,7 +1,8 @@
-from cryptography.hazmat.primitives.asymmetric import rsa, padding as rsa_padding
+from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding as rsa_padding
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 import hashlib
 import os
@@ -33,6 +34,29 @@ def serialize_private_key(private_key):
 
 def deserialize_private_key(pem_data):
     return serialization.load_pem_private_key(pem_data, password=None)
+
+
+def generate_ecdh_keypair():
+    priv = ec.generate_private_key(ec.SECP256R1())
+    return priv, priv.public_key()
+
+def serialize_ecdh_public_key(public_key):
+    return public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+
+def deserialize_ecdh_public_key(pem_data):
+    return serialization.load_pem_public_key(pem_data)
+
+def derive_shared_key(my_ecdh_private, peer_ecdh_public):
+    raw = my_ecdh_private.exchange(ec.ECDH(), peer_ecdh_public)
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b'secure-chat v3'
+    ).derive(raw)
 
 
 def generate_aes_key():
